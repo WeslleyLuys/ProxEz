@@ -1,4 +1,4 @@
-# Omni SIP Proxy
+# ProxEz SIP Proxy
 
 Gateway **WebRTC ↔ SIP** baseado em **Kamailio 5.8** com um **painel administrativo web** (Flask). Termina conexões WebRTC (WSS) de softphones no navegador, roteia dinamicamente para containers Asterisk e oferece um painel para gerenciar registros, firewall, certificados, captura SIP e um WebPhone embutido.
 
