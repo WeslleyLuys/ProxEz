@@ -75,8 +75,8 @@ Flask servido atrás de um nginx (TLS). Recursos:
 Requisitos no host: Debian/Ubuntu, `kamailio` 5.8+ (módulos `tm`, `sl`, `rr`, `path`, `htable`, `http_client`, `websocket`, `tls`, `ctl`), `python3` + `flask`, TLS válido para o domínio, e uma API de provisionamento que resolva `ramal → container`.
 
 ```bash
-git clone <seu-repo> omni-sip-proxy
-cd omni-sip-proxy
+git clone <seu-repo> proxez-sip-proxy
+cd proxez-sip-proxy
 
 cp .env.example .env
 vi .env                 # preencha PROXY_IP, DOMAIN, API_HOST, TLS_*, etc.
