@@ -1,0 +1,558 @@
+#!KAMAILIO
+#
+# Kamailio SIP Proxy - OmniSmart PABX LXD
+# Kamailio = roteador puro. Autenticacao feita pelo Asterisk (401).
+#
+
+####### Global Parameters #########
+
+debug=2
+log_stderror=no
+log_facility=LOG_LOCAL0
+
+children=4
+auto_aliases=no
+enable_tls=yes
+tcp_accept_no_cl=yes
+
+listen=udp:{{PROXY_IP}}:5060
+listen=tcp:{{PROXY_IP}}:5060
+listen=tcp:{{PROXY_IP}}:8080
+listen=tls:{{PROXY_IP}}:8089
+
+port=5060
+
+####### Modules Section ########
+
+loadmodule "tls.so"
+loadmodule "tm.so"
+loadmodule "tmx.so"
+loadmodule "sl.so"
+loadmodule "rr.so"
+loadmodule "pv.so"
+loadmodule "maxfwd.so"
+loadmodule "textops.so"
+loadmodule "textopsx.so"
+loadmodule "siputils.so"
+loadmodule "xlog.so"
+loadmodule "sanity.so"
+loadmodule "nathelper.so"
+loadmodule "path.so"
+loadmodule "htable.so"
+loadmodule "ctl.so"
+loadmodule "http_client.so"
+loadmodule "json.so"
+loadmodule "kemix.so"
+loadmodule "websocket.so"
+loadmodule "xhttp.so"
+
+# ----- tm params -----
+modparam("tm", "failure_reply_mode", 3)
+modparam("tm", "fr_timer", 30000)
+modparam("tm", "fr_inv_timer", 120000)
+
+# ----- rr params -----
+modparam("rr", "enable_full_lr", 1)
+modparam("rr", "append_fromtag", 0)
+
+# ----- nathelper params -----
+modparam("nathelper", "received_avp", "$avp(RECEIVED)")
+
+# ----- tls params -----
+modparam("tls", "private_key", "{{TLS_PRIVATE_KEY}}")
+modparam("tls", "certificate", "{{TLS_CERT}}")
+modparam("tls", "verify_certificate", 0)
+modparam("tls", "require_certificate", 0)
+modparam("tls", "tls_method", "TLSv1.2+")
+
+# ----- websocket params -----
+modparam("websocket", "keepalive_mechanism", 1)
+modparam("websocket", "keepalive_timeout", 15)
+modparam("websocket", "keepalive_processes", 2)
+
+# ----- http_client params -----
+modparam("http_client", "connection_timeout", 2000)
+modparam("http_client", "httpcon", "apiserver_local=>http://127.0.0.1:8888")
+modparam("http_client", "httpcon", "apiserver=>http://{{API_HOST}}:5000")
+
+# ----- htable params -----
+modparam("htable", "htable", "routing=>size=10;autoexpire=600;")
+modparam("htable", "htable", "ipmapping=>size=8;autoexpire=3600;")
+modparam("htable", "htable", "routing_time=>size=10;autoexpire=600;")
+modparam("htable", "htable", "wscontacts=>size=10;autoexpire=3600;")
+modparam("htable", "htable", "sipcontacts=>size=10;autoexpire=3600;")
+modparam("htable", "htable", "wsconn=>size=10;autoexpire=3600;")
+
+####### Routing Logic ########
+
+request_route {
+    if (!mf_process_maxfwd_header("10")) {
+        sl_send_reply("483", "Too Many Hops");
+        exit;
+    }
+
+    if (!sanity_check("17895", "7")) {
+        xlog("L_WARN", "Malformed SIP from $si:$sp\n");
+        exit;
+    }
+
+    # WebSocket/WebRTC NAT fix - sempre setar flag NAT para WS/WSS
+    if (proto == WS || proto == WSS) {
+        force_rport();
+        setflag(5);
+    }
+
+    if (is_method("CANCEL")) {
+        if (t_check_trans()) { route(RELAY); }
+        exit;
+    }
+
+    if (!is_method("ACK")) {
+        if (t_precheck_trans()) { t_check_trans(); exit; }
+        t_check_trans();
+    }
+
+    # Requests via Path (Asterisk envia INVITE com Route header para o proxy)
+    xlog("L_INFO", "PRE-CHECK: method=$rm totag=$tt from=$si ru=$ru route_uri=$route_uri\n");
+    if (!has_totag() && is_present_hf("Route") && loose_route()) {
+        xlog("L_INFO", "Path loose_route: $rm from $si -> $ru\n");
+        record_route();
+        route(RELAY);
+        exit;
+    }
+    # Fallback: se tem Route header apontando pra nos mas loose_route falhou
+    if (!has_totag() && is_present_hf("Route")) {
+        if ($route_uri =~ "{{PROXY_IP}}") {
+            # Salvar received antes de remover Route
+            $var(ruri) = $route_uri;
+            remove_hf("Route");
+            # Enviar ao IP NAT real do telefone (received do Path)
+            $var(rcv) = $(var(ruri){re.subst,/.*received=sip:([^;>]+).*/\1/});
+            # URL-decode (WebSocket clients tem %3btransport%3dws)
+            $var(rcv) = $(var(rcv){s.replace,%3b,;}{s.replace,%3d,=}{s.replace,%3B,;}{s.replace,%3D,=});
+            if ($var(rcv) != $var(ruri) && $var(rcv) != "") {
+                # Para WebSocket: rotear via conexao WS existente
+                if ($var(rcv) =~ "transport=ws") {
+                    if (is_method("OPTIONS")) {
+                        xlog("L_INFO", "Path WS OPTIONS: respondendo 200 para $rm de $si (ru=$ru)\n");
+                        sl_send_reply("200", "OK");
+                        exit;
+                    }
+                    # INVITE WS: entregar via WebSocket com Record-Route para ACK
+                    $var(rcv_ip) = $(var(rcv){re.subst,/([^;]+).*/\1/});
+                    $du = "sip:" + $var(rcv_ip) + ";transport=ws";
+                    remove_hf("Record-Route");
+                    append_hf("Record-Route: <sip:{{PROXY_IP}}:5060;lr;received=sip:$var(rcv)>\r\n");
+                    xlog("L_INFO", "Path WS INVITE: $rm from $si -> WS $var(rcv_ip) (ru=$ru)\n");
+                    route(RELAY);
+                    exit;
+                } else {
+                    # SIP UDP atras de NAT: cliente nao responde a OPTIONS unsolicited.
+                    # Se eh OPTIONS de qualify e o ramal esta no cache (registrado), responder 200 OK direto.
+                    if (is_method("OPTIONS")) {
+                        $var(target_user) = $rU;
+                        if ($sht(routing=>$var(target_user)) != $null) {
+                            xlog("L_INFO", "Path SIP OPTIONS: respondendo 200 para $var(target_user) (cache ativo) de $si\n");
+                            sl_send_reply("200", "OK");
+                            exit;
+                        }
+                    }
+                    $du = "sip:" + $var(rcv);
+                    xlog("L_INFO", "Path manual: $rm from $si -> NAT=$var(rcv) (ru=$ru)\n");
+                }
+                # Record-Route com received embutido para in-dialog usar NAT correto
+                append_hf("Record-Route: <sip:{{PROXY_IP}}:5060;lr;received=sip:$var(rcv)>\r\n");
+            } else {
+                record_route();
+                xlog("L_INFO", "Path manual: $rm from $si -> $ru (direct)\n");
+            }
+            route(RELAY);
+            exit;
+        }
+    }
+
+    # Requests dentro de dialogos
+    if (has_totag()) {
+        # Salvar route_uri ANTES do loose_route para extrair received depois
+        $var(saved_route) = $route_uri;
+        if (loose_route()) {
+            xlog("L_INFO", "In-dialog $rm from $si:$sp -> $du (ruri=$ru) saved_route=$var(saved_route)\n");
+
+            # 1. Se $du aponta pra nos com received (segundo Route do Path)
+            # WS in-dialog fix v2: detecta destino WS por R-URI e mantem transport=ws no $du
+            if ($du != $null && $du =~ "{{PROXY_IP}}" && $du =~ "received=sip:") {
+                $var(du_str) = $du;
+                $var(rcv2) = $(var(du_str){re.subst,/.*received=sip:([^;>]+).*/\1/});
+                $var(rcv2) = $(var(rcv2){s.replace,%3b,;}{s.replace,%3d,=}{s.replace,%3B,;}{s.replace,%3D,=});
+                if ($var(rcv2) != $var(du_str) && $var(rcv2) != "") {
+                    if ($var(rcv2) =~ "transport=ws" || $ru =~ "transport=ws" || $ru =~ "\.invalid") {
+                        $var(rcv2_ip) = $(var(rcv2){re.subst,/([^;]+).*/\1/});
+                        $du = "sip:" + $var(rcv2_ip) + ";transport=ws";
+                        xlog("L_INFO", "In-dialog WS fix (du): $rm -> $var(rcv2_ip) ws\n");
+                    } else {
+                        $du = "sip:" + $var(rcv2);
+                        xlog("L_INFO", "In-dialog NAT fix (du): $rm -> $var(rcv2)\n");
+                    }
+                }
+                remove_hf("Route");
+            }
+            # 2. Se $du e null mas o Route que processamos tinha received
+            #    SO aplicar se vem do Asterisk (rede interna) indo para telefone externo
+            else if ($du == $null && $var(saved_route) =~ "received=sip:" && $si =~ "{{PROXY_NET}}.|{{INTERNAL_NET}}.") {
+                $var(sr) = $var(saved_route);
+                $var(rcv3) = $(var(sr){re.subst,/.*received=sip:([^;>]+).*/\1/});
+                $var(rcv3) = $(var(rcv3){s.replace,%3b,;}{s.replace,%3d,=}{s.replace,%3B,;}{s.replace,%3D,=});
+                if ($var(rcv3) != $var(sr) && $var(rcv3) != "") {
+                    if ($var(rcv3) =~ "transport=ws" || $ru =~ "transport=ws" || $ru =~ "\.invalid") {
+                        $var(rcv3_ip) = $(var(rcv3){re.subst,/([^;]+).*/\1/});
+                        $du = "sip:" + $var(rcv3_ip) + ";transport=ws";
+                        xlog("L_INFO", "In-dialog WS fix (route): $rm -> $var(rcv3_ip) ws\n");
+                    } else {
+                        $du = "sip:" + $var(rcv3);
+                        xlog("L_INFO", "In-dialog NAT fix (route): $rm -> $var(rcv3)\n");
+                    }
+                }
+            }
+            # 3. Se $du aponta pra nos SEM received, limpar
+            if ($du != $null && $du =~ "{{PROXY_IP}}" && !($du =~ "received=")) {
+                $du = $null;
+                remove_hf("Route");
+            }
+
+            if (nat_uac_test("19")) {
+                setflag(5);
+                fix_nated_contact();
+            }
+            route(RELAY);
+            exit;
+        }
+        if (is_method("ACK")) {
+            if (t_check_trans()) { route(RELAY); exit; }
+            exit;
+        }
+        sl_send_reply("404", "Not Found");
+        exit;
+    }
+
+    if (is_method("INVITE|SUBSCRIBE")) {
+        record_route();
+    }
+
+    if (nat_uac_test("19")) {
+        setflag(5);
+        force_rport();
+        # fix_nated_contact so para non-REGISTER (Path cuida do REGISTER)
+        if (!is_method("REGISTER")) {
+            fix_nated_contact();
+        }
+    }
+
+    if (is_method("REGISTER")) {
+        route(REGISTRAR);
+        exit;
+    }
+
+    if (is_method("INVITE|MESSAGE|SUBSCRIBE|NOTIFY|INFO|UPDATE|REFER")) {
+        route(ROUTE_TO_BACKEND);
+        exit;
+    }
+
+    if (is_method("OPTIONS")) {
+        sl_send_reply("200", "OK");
+        exit;
+    }
+
+    sl_send_reply("405", "Method Not Allowed");
+    exit;
+}
+
+# ────────────────────────────────────────────────────────────────────
+# REGISTRAR: Kamailio so roteia. Asterisk faz a autenticacao (401).
+# ────────────────────────────────────────────────────────────────────
+route[REGISTRAR] {
+    xlog("L_INFO", "REGISTER from $fu (IP: $si:$sp)\n");
+
+    # Determinar username: usar auth user se presente, senao From user
+    $var(username) = $fU;
+    if ($au != $null) {
+        $var(username) = $au;
+        xlog("L_INFO", "REGISTER with Auth - user: $var(username)\n");
+    }
+
+    # Detectar UNREGISTER (Expires: 0 ou Contact: *)
+    # Quando o ramal desregistra, limpar do cache para forcar nova consulta
+    $var(expires_hdr) = $hdr(Expires);
+    $var(contact_hdr) = $hdr(Contact);
+    if ($var(expires_hdr) == "0" || $var(contact_hdr) == "*") {
+        if ($sht(routing=>$var(username)) != $null) {
+            $sht(routing=>$var(username)) = $null;
+            $sht(routing_time=>$var(username)) = $null;
+            xlog("L_INFO", "UNREGISTER: cache removido para $var(username)\n");
+        }
+        if ($sht(wscontacts=>$var(username)) != $null) {
+            $sht(wscontacts=>$var(username)) = $null;
+        }
+    }
+
+    # SEMPRE consultar API primeiro (mantem cache sincronizado com decisao da API)
+    $var(api_path) = "/pabx/ramals/proxy/" + $var(username);
+    $var(res) = http_connect("apiserver", $var(api_path), "application/json", "{}", "$avp(api_result)");
+
+    if ($var(res) == 200 || $var(res) == 201) {
+        $var(dest_ip) = $(avp(api_result){s.trim}{s.rmws});
+        if ($var(dest_ip) != "false" && $var(dest_ip) != "null" && $var(dest_ip) != "") {
+            # Detectar mudanca de container e atualizar cache
+            $var(old_ip) = $sht(routing=>$var(username));
+            if ($var(old_ip) != $null && $var(old_ip) != $var(dest_ip)) {
+                xlog("L_INFO", "Cache UPDATE: $var(username) $var(old_ip) -> $var(dest_ip)\n");
+            }
+            $sht(routing=>$var(username)) = $var(dest_ip);
+            $sht(routing_time=>$var(username)) = $TS;
+            xlog("L_INFO", "API OK: $var(username) -> $var(dest_ip)\n");
+            route(FORWARD_REGISTER);
+            exit;
+        } else {
+            # API retornou valor invalido - limpar cache e rejeitar
+            if ($sht(routing=>$var(username)) != $null) {
+                $sht(routing=>$var(username)) = $null;
+            }
+            xlog("L_ERR", "API retornou valor invalido para $var(username): $var(dest_ip)\n");
+            xlog("L_NOTICE", "REGISTER REJECT: user=$var(username) src=$si:$sp reason=invalid_api\n");
+            sl_send_reply("403", "Forbidden");
+            exit;
+        }
+    }
+
+    # API falhou - tentar cache como fallback
+    if ($sht(routing=>$var(username)) != $null) {
+        $var(dest_ip) = $sht(routing=>$var(username));
+        xlog("L_WARN", "API falhou ($var(res)), usando Cache fallback para $var(username) -> $var(dest_ip)\n");
+        route(FORWARD_REGISTER);
+        exit;
+    }
+
+    xlog("L_ERR", "API erro para $var(username): HTTP $var(res) - sem cache\n");
+    sl_send_reply("403", "Forbidden");
+    exit;
+}
+
+route[FORWARD_REGISTER] {
+    xlog("L_INFO", "Forwarding REGISTER to $var(dest_ip):5060\n");
+
+    # Garantir que o REGISTER tenha Supported: path (exigido pelo Asterisk/RFC 3327)
+    if (!is_present_hf("Supported")) {
+        append_hf("Supported: path\r\n");
+    }
+
+    # Path header: Asterisk usara o proxy como rota para alcançar o usuario
+    if (isflagset(5)) {
+        add_path_received();
+        if (proto == WS || proto == WSS) {
+            fix_nated_contact();
+            $sht(wscontacts=>$fU) = $si + ":" + $sp;
+            $var(wskey) = $si + ":" + $sp;
+            $sht(wsconn=>$var(wskey)) = $fU;
+            xlog("L_INFO", "WS REGISTER: $fU from $si:$sp saved to wscontacts\n");
+        } else {
+            # SIP UDP/TCP atras de NAT - salvar para delivery direto
+            $sht(sipcontacts=>$fU) = $si + ":" + $sp;
+            xlog("L_INFO", "SIP REGISTER: $fU from $si:$sp saved to sipcontacts\n");
+        }
+    } else {
+        add_path();
+        # SIP sem NAT - salvar IP:porta de origem tambem
+        $sht(sipcontacts=>$fU) = $si + ":" + $sp;
+    }
+
+    route(TRANSLATE_IP);
+    $du = "sip:" + $var(dest_ip) + ":5060";
+    t_on_reply("REPLY_REGISTER");
+    t_on_failure("FAIL_REGISTER");
+    if (!t_relay()) {
+        sl_send_reply("500", "Internal Server Error");
+    }
+    exit;
+}
+
+route[ROUTE_TO_BACKEND] {
+    $var(dest_user) = $rU;
+    if ($var(dest_user) == $null || $var(dest_user) == "") {
+        $var(dest_user) = $fU;
+    }
+    $var(caller_user) = $fU;
+
+    xlog("L_INFO", "Routing $rm from $var(caller_user) to $var(dest_user)\n");
+
+    # Delivery direto para ramais WebRTC registrados no proxy
+    if ($sht(wscontacts=>$var(dest_user)) != $null) {
+        $var(ws_contact) = $sht(wscontacts=>$var(dest_user));
+        $du = "sip:" + $var(ws_contact) + ";transport=ws";
+        record_route();
+        xlog("L_INFO", "WS delivery: $rm $var(dest_user) -> $var(ws_contact) via WebSocket\n");
+        route(RELAY);
+        exit;
+    }
+
+    # Delivery direto para ramais SIP UDP registrados no proxy
+    # Evita loop quando Asterisk envia INVITE sem Path
+    if ($sht(sipcontacts=>$var(dest_user)) != $null) {
+        $var(sip_contact) = $sht(sipcontacts=>$var(dest_user));
+        $du = "sip:" + $var(sip_contact);
+        record_route();
+        xlog("L_INFO", "SIP delivery: $rm $var(dest_user) -> $var(sip_contact) via UDP\n");
+        route(RELAY);
+        exit;
+    }
+
+    $var(dest_ip) = "";
+
+    # 1. Tentar cache do DESTINO (ramal-a-ramal entre containers)
+    if ($sht(routing=>$var(dest_user)) != $null && $sht(routing=>$var(dest_user)) != "false") {
+        $var(dest_ip) = $sht(routing=>$var(dest_user));
+        xlog("L_INFO", "Cache destino: $var(dest_user) -> Asterisk $var(dest_ip)\n");
+    }
+
+    # 2. Se nao achou no cache, consultar API
+    if ($var(dest_ip) == "" || $var(dest_ip) == $null) {
+        $var(api_path) = "/pabx/ramals/proxy/" + $var(dest_user);
+        $var(res) = http_connect("apiserver", $var(api_path), "application/json", "{}", "$avp(api_result)");
+        if ($var(res) == 200 || $var(res) == 201) {
+            $var(dest_ip) = $(avp(api_result){s.trim}{s.rmws});
+            if ($var(dest_ip) != "false" && $var(dest_ip) != "null" && $var(dest_ip) != "") {
+                $sht(routing=>$var(dest_user)) = $var(dest_ip);
+                xlog("L_INFO", "API destino: $var(dest_user) -> Asterisk $var(dest_ip)\n");
+            } else {
+                $var(dest_ip) = "";
+            }
+        }
+    }
+
+    # 3. Fallback: Asterisk do CHAMADOR (numeros externos, filas, URA)
+    if ($var(dest_ip) == "" || $var(dest_ip) == $null) {
+        if ($sht(routing=>$var(caller_user)) != $null && $sht(routing=>$var(caller_user)) != "false") {
+            $var(dest_ip) = $sht(routing=>$var(caller_user));
+            xlog("L_INFO", "Fallback chamador: $var(caller_user) -> Asterisk $var(dest_ip)\n");
+        } else {
+            # Cache do chamador expirou (routing TTL 600s < Expires do REGISTER).
+            # Consultar API pelo chamador antes de rejeitar - repopula o cache.
+            $var(api_path) = "/pabx/ramals/proxy/" + $var(caller_user);
+            $var(res) = http_connect("apiserver", $var(api_path), "application/json", "{}", "$avp(api_result)");
+            if ($var(res) == 200 || $var(res) == 201) {
+                $var(dest_ip) = $(avp(api_result){s.trim}{s.rmws});
+                if ($var(dest_ip) != "false" && $var(dest_ip) != "null" && $var(dest_ip) != "") {
+                    $sht(routing=>$var(caller_user)) = $var(dest_ip);
+                    $sht(routing_time=>$var(caller_user)) = $TS;
+                    xlog("L_INFO", "Fallback chamador via API: $var(caller_user) -> Asterisk $var(dest_ip)\n");
+                } else {
+                    $var(dest_ip) = "";
+                }
+            }
+            if ($var(dest_ip) == "" || $var(dest_ip) == $null) {
+                xlog("L_ERR", "Sem rota para $var(dest_user) nem $var(caller_user) (API tbm falhou)\n");
+                sl_send_reply("404", "User Not Found");
+                exit;
+            }
+        }
+    }
+
+    # Adicionar User-Agent VirtPBX para Asterisk reconhecer
+    if (is_present_hf("User-Agent")) {
+        remove_hf("User-Agent");
+    }
+    append_hf("User-Agent: VirtPBX\r\n");
+
+    # Responder 100 Trying imediatamente (evita retransmissao WebSocket)
+    if (is_method("INVITE")) {
+        sl_send_reply("100", "Trying");
+    }
+
+    route(TRANSLATE_IP);
+
+    # Reescrever Request-URI para o IP do backend
+    $ru = "sip:" + $rU + "@" + $var(dest_ip) + ":5060";
+    $du = "sip:" + $var(dest_ip) + ":5060";
+    route(RELAY);
+    exit;
+}
+
+
+# ────────────────────────────────────────────────────────────────────
+# Traduz IP privado para publico via Flask/LXD
+# ────────────────────────────────────────────────────────────────────
+route[TRANSLATE_IP] {
+    # Se o IP e privado (11.x), traduzir para publico
+    if ($var(dest_ip) =~ "^11\\.") {
+        # Verificar cache ipmapping primeiro
+        if ($sht(ipmapping=>$var(dest_ip)) != $null) {
+            $var(dest_ip) = $sht(ipmapping=>$var(dest_ip));
+            xlog("L_INFO", "IP translate (cache): $var(dest_ip)\n");
+        } else {
+            # Consultar Flask para traduzir
+            $var(translate_path) = "/api/lxd/translate/" + $var(dest_ip);
+            $var(tres) = http_connect("apiserver_local", $var(translate_path), "text/plain", "", "$avp(translated_ip)");
+            if ($var(tres) == 200) {
+                $var(new_ip) = $(avp(translated_ip){s.trim}{s.rmws});
+                if ($var(new_ip) != "" && $var(new_ip) != $var(dest_ip)) {
+                    $sht(ipmapping=>$var(dest_ip)) = $var(new_ip);
+                    xlog("L_INFO", "IP translate: $var(dest_ip) -> $var(new_ip)\n");
+                    $var(dest_ip) = $var(new_ip);
+                } else {
+                    xlog("L_INFO", "IP translate: $var(dest_ip) sem traducao\n");
+                }
+            }
+        }
+    }
+}
+route[RELAY] {
+    if (isflagset(5)) {
+        add_rr_param(";nat=yes");
+    }
+    if (!t_relay()) {
+        sl_reply_error();
+    }
+    exit;
+}
+
+onreply_route[REPLY_REGISTER] {
+    xlog("L_INFO", "REGISTER reply: $rs $rr from $si\n");
+    if (nat_uac_test("1")) {
+        fix_nated_contact();
+    }
+}
+
+failure_route[FAIL_REGISTER] {
+    if (t_is_canceled()) { exit; }
+    xlog("L_INFO", "REGISTER failure $rs for $fU - relaying back\n");
+    xlog("L_NOTICE", "REGISTER FAIL: code=$rs user=$fU src=$si:$sp\n");
+}
+
+# WebSocket handshake
+event_route[xhttp:request] {
+    set_reply_close();
+    set_reply_no_connect();
+    if (ws_handle_handshake()) { exit; }
+    xhttp_reply("404", "Not Found", "text/html", "<html><body>404</body></html>");
+}
+
+
+# ────────────────────────────────────────────────────────────────────
+# WebSocket fechou (navegador fechado / rede caiu): limpar registro
+# ────────────────────────────────────────────────────────────────────
+event_route[websocket:closed] {
+    $var(clkey) = $si + ":" + $sp;
+    $var(cl_ramal) = $sht(wsconn=>$var(clkey));
+    xlog("L_INFO", "WS CLOSED: conn=$var(clkey) ramal=$var(cl_ramal)\n");
+    if ($var(cl_ramal) != $null && $var(cl_ramal) != "") {
+        # so limpa se o wscontacts ainda aponta para ESTA conexao que fechou
+        # (evita apagar cache de ramal que ja reconectou em outra porta)
+        if ($sht(wscontacts=>$var(cl_ramal)) == $var(clkey)) {
+            $sht(wscontacts=>$var(cl_ramal)) = $null;
+            $sht(routing=>$var(cl_ramal)) = $null;
+            $sht(routing_time=>$var(cl_ramal)) = $null;
+            xlog("L_INFO", "WS CLOSED: cache limpo para $var(cl_ramal) (offline)\n");
+        } else {
+            xlog("L_INFO", "WS CLOSED: $var(cl_ramal) ja reconectou, mantendo cache\n");
+        }
+        $sht(wsconn=>$var(clkey)) = $null;
+    }
+}

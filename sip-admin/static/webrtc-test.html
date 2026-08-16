@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>WebRTC SIP Test — OmniSmart</title>
+<script src="https://cdn.jsdelivr.net/npm/jssip@3.10.0/dist/jssip.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0e1117; color: #e2e8f0; font-family: sans-serif; padding: 24px; }
+  .card { background: #161b27; border: 1px solid #2a3450; border-radius: 8px; padding: 20px; margin-bottom: 16px; max-width: 520px; }
+  h2 { font-size: 16px; color: #94a3b8; margin-bottom: 14px; text-transform: uppercase; letter-spacing: .05em; }
+  label { display: block; font-size: 11px; color: #64748b; text-transform: uppercase; margin-bottom: 4px; margin-top: 10px; }
+  input { width: 100%; background: #1e2536; border: 1px solid #2a3450; border-radius: 6px; color: #e2e8f0; padding: 8px 10px; font-size: 13px; }
+  .btn { display: inline-block; padding: 8px 18px; border-radius: 6px; border: none; font-size: 13px; font-weight: 600; cursor: pointer; margin-top: 10px; margin-right: 6px; }
+  .btn-green  { background: #22c55e; color: #fff; }
+  .btn-red    { background: #ef4444; color: #fff; }
+  .btn-blue   { background: #4f8ef7; color: #fff; }
+  .btn-gray   { background: #2a3450; color: #94a3b8; }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .status { padding: 10px 14px; border-radius: 6px; font-size: 13px; margin-top: 12px; }
+  .status.ok      { background: rgba(34,197,94,.1);  border: 1px solid rgba(34,197,94,.3);  color: #86efac; }
+  .status.err     { background: rgba(239,68,68,.1);  border: 1px solid rgba(239,68,68,.3);  color: #fca5a5; }
+  .status.info    { background: rgba(79,142,247,.1); border: 1px solid rgba(79,142,247,.3); color: #93c5fd; }
+  .status.warn    { background: rgba(245,158,11,.1); border: 1px solid rgba(245,158,11,.3); color: #fcd34d; }
+  #log { background: #0e1117; border: 1px solid #2a3450; border-radius: 6px; padding: 10px; font-family: monospace; font-size: 11px; max-height: 200px; overflow-y: auto; color: #64748b; margin-top: 10px; }
+  .log-ok   { color: #22c55e; }
+  .log-err  { color: #ef4444; }
+  .log-info { color: #4f8ef7; }
+  .log-warn { color: #f59e0b; }
+  audio { display: none; }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <h2>⚙ Configuração SIP</h2>
+  <label>WebSocket URL</label>
+  <input id="ws-url" value="wss://{{DOMAIN}}:8089" />
+  <label>SIP Domain / Realm</label>
+  <input id="sip-domain" value="{{DOMAIN}}" />
+  <label>Usuário (ramal)</label>
+  <input id="sip-user" value="ramalmyk88u" />
+  <label>Senha</label>
+  <input id="sip-pass" type="password" value="{{SSH_PASSWORD}}" />
+  <div style="margin-top:14px">
+    <button class="btn btn-green" id="btn-register" onclick="register()">▶ Registrar</button>
+    <button class="btn btn-red"   id="btn-unregister" onclick="unregister()" disabled>■ Desregistrar</button>
+  </div>
+  <div id="reg-status" class="status info" style="margin-top:12px">● Desconectado</div>
+</div>
+
+<div class="card">
+  <h2>📞 Fazer Chamada</h2>
+  <label>Destino (ramal ou número)</label>
+  <input id="call-dest" placeholder="ex: 1002 ou +5511..." />
+  <div style="margin-top:10px">
+    <button class="btn btn-blue" id="btn-call"   onclick="makeCall()" disabled>📞 Ligar</button>
+    <button class="btn btn-red"  id="btn-hangup" onclick="hangup()"   disabled>✕ Desligar</button>
+    <button class="btn btn-green" id="btn-answer" onclick="answer()" disabled>✓ Atender</button>
+  </div>
+  <div id="call-status" class="status info" style="margin-top:12px">● Sem chamada</div>
+</div>
+
+<div class="card">
+  <h2>≡ Log</h2>
+  <div id="log"></div>
+</div>
+
+<audio id="remote-audio" autoplay></audio>
+<audio id="local-audio"  autoplay muted></audio>
+
+<script>
+let ua = null;
+let currentSession = null;
+
+function log(msg, type='info') {
+  const el = document.getElementById('log');
+  const t = new Date().toLocaleTimeString();
+  el.innerHTML += `<div class="log-${type}">[${t}] ${msg}</div>`;
+  el.scrollTop = el.scrollHeight;
+}
+
+function setRegStatus(msg, type) {
+  const el = document.getElementById('reg-status');
+  el.textContent = msg;
+  el.className = 'status ' + type;
+}
+
+function setCallStatus(msg, type) {
+  const el = document.getElementById('call-status');
+  el.textContent = msg;
+  el.className = 'status ' + type;
+}
+
+function register() {
+  const wsUrl     = document.getElementById('ws-url').value.trim();
+  const domain    = document.getElementById('sip-domain').value.trim();
+  const user      = document.getElementById('sip-user').value.trim();
+  const password  = document.getElementById('sip-pass').value.trim();
+
+  if (ua) { ua.stop(); ua = null; }
+
+  JsSIP.debug.enable('JsSIP:*');
+
+  const socket = new JsSIP.WebSocketInterface(wsUrl);
+  const config = {
+    sockets:          [socket],
+    uri:              `sip:${user}@${domain}`,
+    password:         password,
+    register:         true,
+    register_expires: 300,
+    contact_uri:      `sip:${user}@${domain};transport=wss`,
+    user_agent:       'OmniSmart WebRTC Test',
+  };
+
+  ua = new JsSIP.UA(config);
+
+  ua.on('connecting',    () => { setRegStatus('⟳ Conectando ao WebSocket...', 'warn'); log('Conectando ao WS...'); });
+  ua.on('connected',     () => { setRegStatus('✓ WebSocket conectado', 'info'); log('WS conectado', 'ok'); });
+  ua.on('disconnected',  () => { setRegStatus('✗ WebSocket desconectado', 'err'); log('WS desconectado', 'err'); setButtons(false); });
+  ua.on('registered',    () => { setRegStatus(`✓ Registrado — ${user}@${domain}`, 'ok'); log(`Registrado: ${user}@${domain}`, 'ok'); setButtons(true); });
+  ua.on('unregistered',  () => { setRegStatus('● Desregistrado', 'info'); log('Desregistrado'); setButtons(false); });
+  ua.on('registrationFailed', (e) => {
+    setRegStatus(`✗ Falha no registro: ${e.cause}`, 'err');
+    log(`Falha registro: ${e.cause}`, 'err');
+  });
+
+  ua.on('newRTCSession', (e) => {
+    if (e.originator === 'remote') {
+      currentSession = e.session;
+      const caller = e.session.remote_identity.uri.toString();
+      setCallStatus(`📲 Chamada recebida de ${caller}`, 'warn');
+      log(`Chamada de ${caller}`, 'warn');
+      document.getElementById('btn-answer').disabled = false;
+      document.getElementById('btn-hangup').disabled = false;
+      setupSession(e.session);
+    }
+  });
+
+  ua.start();
+  log(`Iniciando UA: ${user}@${domain} via ${wsUrl}`);
+}
+
+function setupSession(session) {
+  session.on('confirmed',  () => { setCallStatus('● Em chamada', 'ok'); log('Chamada confirmada', 'ok'); });
+  session.on('ended',      () => { setCallStatus('● Chamada encerrada', 'info'); log('Chamada encerrada'); resetCallButtons(); });
+  session.on('failed',     (e) => { setCallStatus(`✗ Falha: ${e.cause}`, 'err'); log(`Chamada falhou: ${e.cause}`, 'err'); resetCallButtons(); });
+  session.on('peerconnection', (e) => {
+    e.peerconnection.ontrack = (ev) => {
+      const audio = document.getElementById('remote-audio');
+      if (audio.srcObject !== ev.streams[0]) {
+        audio.srcObject = ev.streams[0];
+        log('Áudio remoto conectado', 'ok');
+      }
+    };
+  });
+}
+
+function makeCall() {
+  const dest   = document.getElementById('call-dest').value.trim();
+  const domain = document.getElementById('sip-domain').value.trim();
+  if (!dest || !ua) return;
+
+  const target = dest.includes('@') ? dest : `sip:${dest}@${domain}`;
+
+  const options = {
+    mediaConstraints: { audio: true, video: false },
+    pcConfig: {
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    },
+  };
+
+  currentSession = ua.call(target, options);
+  setupSession(currentSession);
+  setCallStatus(`⟳ Chamando ${dest}...`, 'warn');
+  log(`Chamando: ${target}`, 'info');
+  document.getElementById('btn-hangup').disabled = false;
+  document.getElementById('btn-call').disabled   = true;
+}
+
+function answer() {
+  if (!currentSession) return;
+  currentSession.answer({
+    mediaConstraints: { audio: true, video: false },
+    pcConfig: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] },
+  });
+  document.getElementById('btn-answer').disabled = true;
+  log('Chamada atendida', 'ok');
+}
+
+function hangup() {
+  if (currentSession) { currentSession.terminate(); currentSession = null; }
+  resetCallButtons();
+}
+
+function unregister() {
+  if (ua) { ua.unregister(); ua.stop(); ua = null; }
+}
+
+function setButtons(registered) {
+  document.getElementById('btn-register').disabled   = registered;
+  document.getElementById('btn-unregister').disabled = !registered;
+  document.getElementById('btn-call').disabled       = !registered;
+}
+
+function resetCallButtons() {
+  document.getElementById('btn-call').disabled   = ua && ua.isRegistered() ? false : true;
+  document.getElementById('btn-hangup').disabled = true;
+  document.getElementById('btn-answer').disabled = true;
+  currentSession = null;
+}
+</script>
+</body>
+</html>

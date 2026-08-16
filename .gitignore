@@ -1,0 +1,40 @@
+# Segredos e configuração de ambiente
+.env
+*.env
+users.json
+lxd_config.json
+lxd_servers.json
+firewall_rules.json
+ip_mapping.json
+*.secret
+
+# Chaves e certificados
+*.key
+*.pem
+*.crt
+*.cer
+*.p12
+*.pfx
+
+# Backups gerados em runtime
+*.bak
+*.bak.*
+kamailio.cfg          # apenas o .template vai versionado; o renderizado não
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
